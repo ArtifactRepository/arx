@@ -2,23 +2,20 @@
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use common::{
-	archive::{
-		Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, CompressionAlgorithm,
-		CompressionLevel, FileEntryData, RawEntryData, SourceFileEntryData, HEADER,
-	},
-	object_body::Object as OtherObject,
-	read_header_and_body, read_header_from_file, read_header_from_slice,
-	read_object_into_headers_sync, Hash, Header, Mode, ObjectType, BLOB_KEY, INDEX_KEY, TREE_KEY,
+	BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY, archive::{
+		Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, CompressionAlgorithm, CompressionLevel, FileEntryData, HEADER, RawEntryData, SourceFileEntryData,
+	}, object_body::{Object as OtherObject, TreeEntry}, read_header_and_body, read_header_from_file, read_header_from_slice, read_object_into_headers_sync,
 };
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::{
-	collections::HashMap,
+	collections::{BTreeMap, HashMap},
 	fs::{create_dir, create_dir_all, read_dir, File},
 	io::{BufRead, BufReader, BufWriter, Read, Write},
 	ops::Deref,
 	path::{Path, PathBuf},
 	str::from_utf8,
+	sync::RwLock,
 };
 use ureq::SendBody;
 
@@ -626,6 +623,321 @@ impl<T: Object> Hashed<T> {
 	}
 }
 
+//////////////////////////////////////////////////// LOGIC //////////////////////////////////////////////////////////////////
+
+enum BlobData {
+	Buffer(Vec<u8>),
+	Path(PathBuf),
+	BufferWithFallback(Vec<u8>, PathBuf),
+}
+
+enum StoreData {
+	Index(common::object_body::Index),
+	Tree(common::object_body::Tree),
+	Blob(BlobData),
+}
+
+struct MemoryEntry {
+	header: Header,
+	hit_count: usize,
+	data: StoreData,
+}
+
+struct MemoryStore {
+	objects: RwLock<BTreeMap<Hash, MemoryEntry>>,
+}
+
+struct DiskStore {}
+
+enum Store {
+	Memory(MemoryStore),
+	// Disk(DiskStore)
+}
+
+impl Store {
+	pub fn new_memory() -> Store {
+		Store::Memory( MemoryStore { objects: RwLock::new(BTreeMap::new()) })
+	}
+	pub fn has_object(&self, hash: &Hash) -> bool {
+		match self {
+			Store::Memory(memory_store) => {
+				let objects = memory_store.objects.read().expect("not poisoned");
+				objects.contains_key(hash)
+			}
+		}
+	}
+	pub fn get_object_metadata(&self, hash: &Hash) -> Option<Header> {
+		match self {
+			Store::Memory(memory_store) => {
+				let objects = memory_store.objects.read().expect("not poisoned");
+				objects.get(hash).and_then(|obj| Some(obj.header))
+			}
+		}
+	}
+
+	pub fn get_tree<'a>(&'a self, hash: &Hash) -> Option<common::object_body::Tree> {
+		match self {
+			Store::Memory(memory_store) => {
+				let objects = memory_store.objects.read().expect("not poisoned");
+				let tree = objects.get(hash)?;
+				assert!(tree.header.object_type == ObjectType::Tree);
+				let StoreData::Tree(tree) = &tree.data else {
+					panic!("Fatal error, Object has type Tree but not StoreData::Tree");
+				};
+				Some(tree.clone())
+			}
+		}
+	}
+
+	pub fn get_index<'a>(&'a self, hash: &Hash) -> Option<common::object_body::Index> {
+		match self {
+			Store::Memory(memory_store) => {
+				let objects = memory_store.objects.read().expect("not poisoned");
+				let index = objects.get(hash)?;
+				assert!(index.header.object_type == ObjectType::Index);
+				let StoreData::Index(index) = &index.data else {
+					panic!("Fatal error, Object has type Index but not StoreData::Index");
+				};
+				Some(index.clone())
+			}
+		}
+	}
+
+	pub fn add_object(&self, hash: Hash, header: Header, data: StoreData) -> anyhow::Result<()> {
+		match self {
+			Store::Memory(memory_store) => {
+				let mut objects = memory_store.objects.write().expect("not poisoned");
+				let entry = objects.entry(hash).or_insert(MemoryEntry { header, data, hit_count: 0 });
+				entry.hit_count += 1;
+			}
+		}
+		Ok(())
+	}
+
+	pub fn to_archive(self, algorithm: CompressionAlgorithm, index_hash: &Hash) -> Archive<ArchiveEntry>  {
+		let Store::Memory(store) = self else {
+			panic!("oho");
+		};
+
+		let mut objects = store.objects.into_inner().expect("Lock to not be poisoned");
+
+		// We assume that there is only 1 header and only relevant data was tracked in the store. so we can take the length as the size (minus the index itself)
+		let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::with_capacity(objects.len() - 1);
+		let mut body_entries: Vec<ArchiveEntry> = Vec::with_capacity(objects.len() - 1);
+
+		let MemoryEntry { header: index_header, data: index_data, .. } = objects.remove(index_hash).expect("Index to exist within store");
+		assert!(index_header.object_type == ObjectType::Index);
+		let StoreData::Index(index) = index_data else {
+			panic!("Index has the right object type but contains the wrong data");
+		};
+
+		objects.remove(index_hash);
+
+		let mut items : Vec<_> = objects.into_iter().collect();
+
+		// This ensures all trees get moved to the beginning to maximize parallelism, Order doesn't matter and further optimization is possible
+		items.sort_by(|a, b| a.1.header.object_type.cmp(&b.1.header.object_type));
+		let mut offset = 0;
+		for (hash, entry) in items.into_iter() {
+			assert!(entry.header.object_type != ObjectType::Index);
+
+			let length = entry.header.size;
+			header_entries.push(ArchiveHeaderEntry {
+				hash,
+				index: offset,
+				length
+			});
+			body_entries.push(
+				match entry.data {
+					StoreData::Index(_) => panic!("This should never be possible"),
+					StoreData::Tree(tree) => {
+						ArchiveEntry::Raw(RawEntryData::new(tree.to_object_data()), entry.header.size)
+					},
+					StoreData::Blob(blob) => match blob {
+						BlobData::Buffer(buf) | BlobData::BufferWithFallback(buf, _) => {
+							ArchiveEntry::Raw(RawEntryData::new(buf), entry.header.size)
+						}
+						BlobData::Path(path) => ArchiveEntry::Source(SourceFileEntryData {header: entry.header, source_path: path}, entry.header.size)
+					}
+				}
+			);
+			offset += length;
+		}
+
+		Archive {
+			header: HEADER,
+			version: 0,
+			compression: algorithm,
+			hash: index_hash.clone(),
+			index: index,
+			body: ArchiveBody {
+				header: header_entries,
+				entries: body_entries,
+			},
+		}
+	}
+}
+
+fn get_total_size_store(store: &Store, hash: &Hash) -> u128 {
+	let header = store.get_object_metadata(hash).expect("object to be present");
+
+	match header.object_type {
+		ObjectType::Blob => {
+			header.size as u128
+		}
+    ObjectType::Tree => {
+    	let mut total = header.size as u128;
+     	let tree = store.get_tree(hash).expect("Store to contain tree");
+      	for item in tree.contents {
+     		total += get_total_size_store(store, &item.hash);
+       }
+       total
+    },
+    ObjectType::Index => {
+    	let index = store.get_index(hash).expect("Store to contain index");
+     	header.size as u128 + get_total_size_store(store, &index.tree)
+    },
+}
+}
+
+fn read_file_into_blob(store: &Store, path: &Path) -> anyhow::Result<Hash> {
+	if !path.is_file() {
+		println!("Path is not file????? {path:?}");
+	}
+	assert!(path.is_file());
+
+	let size = path.metadata().unwrap().len();
+
+	let data: BlobData = {
+		let mut buffer = Vec::new();
+		if size <= 1024 * 1024 {
+			let mut file = std::fs::File::open(path)?;
+			file.read_to_end(&mut buffer)?;
+
+			if size < 1024 {
+				BlobData::Buffer(buffer)
+			} else {
+				BlobData::BufferWithFallback(buffer, path.to_path_buf())
+			}
+		} else {
+			BlobData::Path(path.to_path_buf())
+		}
+	};
+
+	let header = Header::new(ObjectType::Blob, size);
+
+	let mut hasher = Sha256::new();
+	hasher.write_all(&header.to_bytes())?;
+
+	match &data {
+		BlobData::Buffer(buf) | BlobData::BufferWithFallback(buf, _) => {
+			hasher.write_all(buf)?;
+		},
+		BlobData::Path(path) => {
+			let f = File::open(&path).unwrap();
+			let mut reader = BufReader::new(f);
+
+			let mut buf: [u8; 1024] = [0; 1024];
+
+			while let Ok(bytes_read) = reader.read(&mut buf) {
+				if bytes_read == 0 {
+					break;
+				}
+
+				hasher.write_all(&buf[..bytes_read]).unwrap();
+			}
+
+		}
+	}
+
+	let hash = Hash::from(hasher);
+
+	store.add_object(hash.clone(), header, StoreData::Blob(data))?;
+
+	Ok(hash)
+}
+
+fn read_dir_into_tree(store: &Store, path: &Path) -> anyhow::Result<Hash> {
+	let entries: Vec<PathBuf> = std::fs::read_dir(path)
+		.expect("Failed to read directory")
+		.map(|entry| entry.expect("Failed to read directory entry").path())
+		.collect();
+
+	let contents: Result<Vec<(Mode, String, Hash)>, _> = entries
+		.par_iter()
+		.filter_map(|path| {
+			let Some(name) = path.file_name() else {
+				return Some(Err(anyhow::format_err!("path did not have a filename component")));
+			};
+
+			match (path.is_dir(), path.is_file()) {
+				(true, false) => Some(read_dir_into_tree(store, path).and_then(|hash| Ok((Mode::Tree, name.to_string_lossy().to_string(), hash)))),
+				(false, true) => Some(read_file_into_blob(store, path).and_then(|hash| Ok((Mode::Normal, name.to_string_lossy().to_string(), hash)))),
+				(false, false) => {
+					// Err(anyhow::format_err!("What the hell, {path:?} is neither a file nor a directory??? symlink: {}", path.is_symlink()))
+					None
+				},
+				(true, true) => {
+					panic!("The universe is a lie");
+				},
+			}
+		})
+
+		.collect();
+
+	let mut contents = contents?;
+
+	// read_dir returns entries in filesystem order, which is not
+	// guaranteed to be stable. Sort by name so the resulting tree hash
+	// is deterministic across platforms and repeated runs.
+	contents.sort_by(|a, b| a.1.cmp(&b.1));
+
+	let contents = contents.into_iter().map(|(mode, name, hash)| TreeEntry {hash, mode, path: name}).collect();
+
+	let tree = common::object_body::Tree { contents };
+
+	let tree_data = tree.to_object_data();
+
+	let header = Header { object_type: ObjectType::Tree, size: tree_data.len() as u64 };
+
+	let mut hasher = Sha256::new();
+
+	hasher.write_all(&header.to_bytes())?;
+	hasher.write_all(&tree_data)?;
+
+	let hash = Hash::from(hasher);
+
+	store.add_object(hash.clone(), header, StoreData::Tree(tree))?;
+
+	Ok(hash)
+}
+
+fn read_dir_into_index(store: &Store, dir: &Path) -> anyhow::Result<Hash> {
+	let tree_hash = read_dir_into_tree(store, dir)?;
+
+	let index = common::object_body::Index {
+		timestamp: Utc::now(),
+		tree: tree_hash,
+		metadata: HashMap::new()
+	};
+
+	let data = index.to_object_data();
+
+	let header = Header::new(ObjectType::Index, data.len() as u64);
+
+	let mut hasher = Sha256::new();
+	hasher.write_all(&header.to_bytes())?;
+	hasher.write_all(&data)?;
+
+	let hash = Hash::from(hasher);
+
+	store.add_object(hash.clone(), header, StoreData::Index(index))?;
+
+	Ok(hash)
+}
+
+//////////////////////////////////////////////////// Commands /////////////////////////////////////////////////////////////////
+
 fn get_total_size(index: &Hashed<Tree>) -> u128 {
 	let mut total = 0;
 
@@ -823,7 +1135,7 @@ fn pull_tree(cache: &PathBuf, url: &String, tree_hash: &Hash) {
 
 	let (_, data) = read_header_and_body(&index_data).expect("Index to be in the correct format");
 
-	let index_body = common::object_body::Tree::from_data(data);
+	let index_body = common::object_body::Tree::from_object_data(data);
 
 	for entry in index_body.contents {
 		let obj_path = entry.hash.get_path(cache);
@@ -857,7 +1169,7 @@ fn pull_cache(cache: &PathBuf, url: &String, hash: Hash) {
 
 	let (_, data) = read_header_and_body(&index_data).expect("Index to be in the correct format");
 
-	let index_body = common::object_body::Index::from_data(data);
+	let index_body = common::object_body::Index::from_object_data(data);
 
 	pull_tree(cache, url, &index_body.tree);
 }
@@ -974,7 +1286,7 @@ fn pack_archive(
 		let (header, body) = read_header_and_body(&data).expect("File to be correctly formatted");
 		assert!(header.object_type == ObjectType::Index);
 
-		common::object_body::Index::from_data(body)
+		common::object_body::Index::from_object_data(body)
 	};
 
 	let mut headers: HashMap<Hash, Header> = HashMap::new();
@@ -1033,7 +1345,7 @@ fn unpack_archive(cache: &Path, path: &Path) -> anyhow::Result<()> {
 
 	println!("Successfully read archive, Index {}", archive.hash);
 
-	let index_data = archive.index.to_data();
+	let index_data = archive.index.to_object_data();
 	let index_header = Header::new(ObjectType::Index, index_data.len() as u64);
 
 	let mut hasher = Sha256::new();
@@ -1149,50 +1461,26 @@ fn archive_directory(
 	// start timer
 	let start = std::time::Instant::now();
 
-	let hashed_index = Index::from_path(&directory, None);
+	let store = Store::new_memory();
+
+	let index_hash = read_dir_into_index(&store, directory.as_path())?;
+
+	// let hashed_index = Index::from_path(&directory, None);
 
 	println!(
 		"Finished generating Index for {} bytes of data in {} seconds",
-		get_total_size(&hashed_index.tree),
+		get_total_size_store(&store, &index_hash),
 		start.elapsed().as_secs_f64()
 	);
 
-	// Collect trees + blobs, deduping by hash. Index lives in the archive
-	// header, not in body entries.
-	let mut entries: HashMap<Hash, ArchiveEntry> = HashMap::new();
-	collect_archive_entries(&hashed_index.tree, &mut entries);
+	let index = store.get_index(&index_hash).ok_or(anyhow::format_err!("Something seriously bad has happened"))?;
 
-	let mut offset: u64 = 0;
-	let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::with_capacity(entries.len());
-	let mut body_entries: Vec<ArchiveEntry> = Vec::with_capacity(entries.len());
-	for (hash, entry) in entries {
-		let length = entry.length();
-		header_entries.push(ArchiveHeaderEntry {
-			hash: hash.clone(),
-			index: offset,
-			length,
-		});
-		body_entries.push(entry);
-		offset += length;
-	}
+	println!(
+		"Tree Hash: {}",
+		index.tree
+	);
 
-	let archive_index = common::object_body::Index {
-		tree: hashed_index.tree.hash.clone(),
-		timestamp: hashed_index.timestamp,
-		metadata: HashMap::new(),
-	};
-
-	let archive = Archive {
-		header: HEADER,
-		version: 0,
-		compression: algorithm,
-		hash: hashed_index.hash.clone(),
-		index: archive_index,
-		body: ArchiveBody {
-			header: header_entries,
-			entries: body_entries,
-		},
-	};
+	let archive = store.to_archive(algorithm, &index_hash);
 
 	let out = File::create(out_file)?;
 	let mut writer = BufWriter::new(out);
@@ -1203,7 +1491,7 @@ fn archive_directory(
 		start.elapsed().as_secs_f64()
 	);
 
-	println!("{}", hashed_index.hash);
+	println!("{}", index_hash);
 	Ok(())
 }
 
@@ -1292,6 +1580,14 @@ enum Commands {
 		#[arg(long, default_value_t, allow_hyphen_values = true)]
 		level: CompressionLevel,
 	},
+
+	// Extract {
+	// 	#[arg(short)]
+	// 	file: PathBuf,
+
+	// 	#[arg(short, long)]
+	// 	directory: Option<PathBuf>,
+	// },
 }
 
 fn main() {
@@ -1382,7 +1678,7 @@ mod tests {
 		let archive = Archive::<RawEntryData>::from_data(&mut reader).expect("archive to parse");
 
 		// Archive hash must match the SHA-256 of the index header + body bytes
-		let index_data = archive.index.to_data();
+		let index_data = archive.index.to_object_data();
 		let index_header = Header::new(ObjectType::Index, index_data.len() as u64);
 		let mut hasher = Sha256::new();
 		hasher

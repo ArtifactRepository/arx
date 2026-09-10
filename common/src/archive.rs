@@ -176,7 +176,7 @@ where
 		writer.write_all(&[self.version])?;
 		writer.write_all(&(self.compression as u16).to_be_bytes())?;
 		writer.write_all(&self.hash.hash)?;
-		writer.write_all(&self.index.to_data())?;
+		writer.write_all(&self.index.to_object_data())?;
 		writer.write_all(&[0])?;
 
 		let numerical_level = compression_level.get_compression_level(self.compression)?;
@@ -242,7 +242,7 @@ where
 		let mut index_bytes = Vec::new();
 		let index_bytes_read = reader.read_until(0, &mut index_bytes)?;
 
-		let index = Index::from_data(&index_bytes[..index_bytes_read - 1]);
+		let index = Index::from_object_data(&index_bytes[..index_bytes_read - 1]);
 
 		let body = match compression {
 			CompressionAlgorithm::None => ArchiveBody::<RawEntryData>::from_data(&mut reader)?,

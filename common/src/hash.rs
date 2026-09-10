@@ -78,6 +78,18 @@ impl PartialEq for Hash {
 
 impl Eq for Hash {}
 
+impl PartialOrd for Hash {
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+		self.hash.partial_cmp(&other.hash)
+	}
+}
+
+impl Ord for Hash {
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		self.hash.cmp(&other.hash)
+	}
+}
+
 impl FromStr for Hash {
 	type Err = anyhow::Error;
 

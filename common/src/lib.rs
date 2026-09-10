@@ -93,7 +93,7 @@ pub async fn read_object_into_headers(
 			"Read size must match header size"
 		);
 
-		let tree = crate::object_body::Tree::from_data(&data);
+		let tree = crate::object_body::Tree::from_object_data(&data);
 
 		for entry in &tree.contents {
 			stack.push(entry.hash.clone());
@@ -137,7 +137,7 @@ pub fn read_object_into_headers_sync(
 		data.clear();
 		reader.read_to_end(&mut data)?;
 
-		let tree = crate::object_body::Tree::from_data(&data);
+		let tree = crate::object_body::Tree::from_object_data(&data);
 
 		for entry in &tree.contents {
 			stack.push(entry.hash.clone());

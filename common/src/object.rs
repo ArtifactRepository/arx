@@ -18,6 +18,10 @@ impl Object {
 		hasher.into()
 	}
 
+	pub fn header(&self) -> Header {
+		self.header
+	}
+
 	pub fn from_data(data: &[u8]) -> Option<Self> {
 		let mut reader = BufReader::new(data);
 		Self::read_from(&mut reader).ok()

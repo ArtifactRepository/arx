@@ -24,6 +24,10 @@ impl Header {
 		format!("{} {}\0", self.object_type.to_str(), self.size)
 	}
 
+	pub fn to_bytes(&self) -> Vec<u8> {
+		return self.to_string().into_bytes()
+	}
+
 	pub async fn write_to_async(
 		&self,
 		writer: &mut (impl AsyncWrite + std::marker::Unpin),

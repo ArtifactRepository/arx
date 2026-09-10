@@ -299,7 +299,7 @@ async fn get_bundle(
 		.await
 		.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
-	let index = Index::from_data(&index_data);
+	let index = Index::from_object_data(&index_data);
 
 	let mut headers = HashMap::new();
 

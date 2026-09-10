@@ -1,26 +1,33 @@
-use std::{collections::HashMap, io::Write, str::from_utf8};
+use std::{
+	collections::HashMap,
+	fs::File,
+	io::{Read, Write},
+	path::PathBuf,
+	str::from_utf8,
+};
 
 use chrono::{DateTime, Utc};
 
-use crate::{Hash, Mode};
+use crate::{Hash, Mode, ObjectType};
 
-pub trait Object {
-	fn from_data(data: &[u8]) -> Self;
-	fn to_data(&self) -> Vec<u8>;
+pub trait Object<'a> {
+	fn get_type() -> ObjectType;
+	fn from_object_data(data: &'a [u8]) -> Self;
+	fn to_object_data(&self) -> Vec<u8>;
 }
 
 const TREE_KEY: &str = "tree";
 const TIMESTAMP_KEY: &str = "timestamp";
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Index {
 	pub tree: Hash,
 	pub timestamp: DateTime<Utc>,
 	pub metadata: HashMap<String, String>,
 }
 
-impl Object for Index {
+impl Object<'_> for Index {
 	//TODO: This HAS to return a result. We need to fix that
-	fn from_data(data: &[u8]) -> Self {
+	fn from_object_data(data: &[u8]) -> Self {
 		let string_data = from_utf8(data).expect("Data to be in valid utf8 format");
 
 		assert!(
@@ -78,7 +85,7 @@ impl Object for Index {
 		}
 	}
 
-	fn to_data(&self) -> Vec<u8> {
+	fn to_object_data(&self) -> Vec<u8> {
 		let mut data: Vec<u8> = Vec::new();
 
 		fn write_kv(data: &mut Vec<u8>, key: &str, value: &str) -> anyhow::Result<()> {
@@ -101,21 +108,25 @@ impl Object for Index {
 
 		data
 	}
+
+	fn get_type() -> ObjectType {
+		ObjectType::Index
+	}
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TreeEntry {
 	pub mode: Mode,
 	pub path: String,
 	pub hash: Hash,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Tree {
 	pub contents: Vec<TreeEntry>,
 }
-impl Object for Tree {
-	fn from_data(data: &[u8]) -> Self {
+impl Object<'_> for Tree {
+	fn from_object_data(data: &[u8]) -> Self {
 		let mut contents = Vec::new();
 
 		let mut index: usize = 0;
@@ -152,7 +163,7 @@ impl Object for Tree {
 		Tree { contents }
 	}
 
-	fn to_data(&self) -> Vec<u8> {
+	fn to_object_data(&self) -> Vec<u8> {
 		let mut data: Vec<u8> = Vec::new();
 
 		fn write_entry(data: &mut Vec<u8>, entry: &TreeEntry) -> anyhow::Result<()> {
@@ -170,5 +181,42 @@ impl Object for Tree {
 		}
 
 		data
+	}
+
+	fn get_type() -> ObjectType {
+		ObjectType::Tree
+	}
+}
+
+enum BlobData<'a> {
+	File(PathBuf),
+	Buffer(&'a [u8]),
+}
+
+struct Blob<'a> {
+	data: BlobData<'a>,
+}
+
+impl<'a> Object<'a> for Blob<'a> {
+	fn from_object_data(data: &'a [u8]) -> Blob<'a> {
+		Blob {
+			data: BlobData::Buffer(data),
+		}
+	}
+
+	fn to_object_data(&self) -> Vec<u8> {
+		let mut buffer = Vec::new();
+		match &self.data {
+			BlobData::Buffer(buf) => buffer.copy_from_slice(buf),
+			BlobData::File(path) => {
+				let mut file = File::open(path).expect("File to exist");
+				File::read_to_end(&mut file, &mut buffer).expect("File read to succeed");
+			}
+		}
+		buffer
+	}
+
+	fn get_type() -> ObjectType {
+		ObjectType::Blob
 	}
 }

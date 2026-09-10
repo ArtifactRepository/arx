@@ -2,7 +2,7 @@ use crate::{BLOB_KEY, INDEX_KEY, TREE_KEY};
 use std::fmt::Display;
 
 #[allow(clippy::zero_prefixed_literal)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Mode {
 	Tree = 040000,
 	Normal = 100644,
@@ -45,27 +45,27 @@ impl Display for Mode {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ObjectType {
-	Blob,
-	Tree,
-	Index,
+	Index = 0,
+	Tree = 1,
+	Blob = 2,
 }
 
 impl ObjectType {
 	#[allow(clippy::should_implement_trait)]
 	pub fn from_str(value: &str) -> Option<Self> {
 		match value {
-			BLOB_KEY => Some(Self::Blob),
-			TREE_KEY => Some(Self::Tree),
 			INDEX_KEY => Some(Self::Index),
+			TREE_KEY => Some(Self::Tree),
+			BLOB_KEY => Some(Self::Blob),
 			_ => None,
 		}
 	}
 
 	pub fn to_str(&self) -> &'static str {
 		match self {
-			Self::Blob => BLOB_KEY,
 			Self::Index => INDEX_KEY,
 			Self::Tree => TREE_KEY,
+			Self::Blob => BLOB_KEY,
 		}
 	}
 }

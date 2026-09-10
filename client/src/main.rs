@@ -958,6 +958,7 @@ fn pack_archive(
 	compression: CompressionAlgorithm,
 	compression_level: CompressionLevel,
 ) -> anyhow::Result<()> {
+	let path = std::path::absolute(path)?;
 	assert!(!path.exists());
 	assert!(path.parent().map(|p| p.exists() && p.is_dir()) == Some(true));
 
@@ -1133,6 +1134,7 @@ fn archive_directory(
 	algorithm: CompressionAlgorithm,
 	level: CompressionLevel,
 ) -> anyhow::Result<()> {
+	let out_file = std::path::absolute(out_file)?;
 	assert!(!out_file.exists(), "output file must not already exist");
 	assert!(
 		out_file.parent().map(|p| p.exists() && p.is_dir()) == Some(true),

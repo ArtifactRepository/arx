@@ -38,7 +38,7 @@ impl Hash {
 		}
 
 		Some(Self {
-			hash: hash.try_into().unwrap(),
+			hash: hash.try_into().ok()?,
 			hash_string: value.to_owned(),
 		})
 	}
